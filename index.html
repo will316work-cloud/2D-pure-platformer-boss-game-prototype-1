@@ -90,7 +90,7 @@ function fallbackDeviatedX(w,refs){
   return Math.max(WALL_L+10,Math.min(W-WALL_L-10-w,targetCenter-w/2));
 }
 const NUT_RADIUS=9; // nut body radius (2x its previous size)
-const DEBUG_MODE=true; // press 1-5 in-game to jump straight to any boss section
+const DEBUG_MODE=false; // press 1-5 in-game to jump straight to any boss section
 
 // ── BEE HIVE (Arena 3 only) ────────────────────────────────────────────────────
 const HIVE_RADIUS=((52+64)/2)*(2/3); // was an oval (52,64) ~4x the fruit; now a circle at 2/3 that size (~38.7)
