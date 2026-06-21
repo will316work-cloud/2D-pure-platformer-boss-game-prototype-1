@@ -1,0 +1,1593 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a0a2e;display:flex;justify-content:center;align-items:center;height:100vh;font-family:'Arial Black',sans-serif}
+canvas{display:block}
+#ui{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
+#msg{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:28px;text-align:center;text-shadow:3px 3px 0 #000;pointer-events:all;display:none}
+#msg button{display:block;margin:16px auto 0;font-size:20px;padding:10px 28px;background:#e8c040;border:4px solid #a07000;color:#2a1000;cursor:pointer;font-family:inherit;border-radius:4px}
+#adBtn{background:#40a0e8;border-color:#0060a0;color:#fff;margin-top:8px}
+#modeToggle{margin-top:14px;font-size:14px;pointer-events:all}
+#msg .modeBtn{display:inline-block;font-size:14px;padding:6px 14px;background:#555;border:2px solid #333;color:#ddd;cursor:pointer;font-family:inherit;border-radius:4px;margin:0 4px}
+#msg .modeBtn.modeActive{background:#e8c040;border-color:#a07000;color:#2a1000}
+#timeLimitRow{margin-top:8px;font-size:13px;color:#ddd}
+#timeLimitInput{width:55px;font-size:13px;padding:2px}
+#pauseMenu{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font-size:26px;text-align:center;text-shadow:3px 3px 0 #000;pointer-events:all;display:none}
+#pauseMenu button{display:block;margin:14px auto 0;font-size:18px;padding:10px 28px;background:#e8c040;border:4px solid #a07000;color:#2a1000;cursor:pointer;font-family:inherit;border-radius:4px}
+#pauseMenu #homeBtn{background:#888;border-color:#444}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui"><div id="msg"><span id="mtext"></span>
+  <div id="modeToggle">
+    <button id="modeLivesBtn" class="modeBtn modeActive" onclick="setGameMode('lives')">❤️ Limited Lives</button>
+    <button id="modeTimeBtn" class="modeBtn" onclick="setGameMode('time')">⏰ Limited Time</button>
+    <div id="timeLimitRow" style="display:none">Time limit: <input id="timeLimitInput" type="number" value="120" min="30" max="600" step="10">s</div>
+  </div>
+  <button id="mbtn">START</button>
+  <button id="adBtn" style="display:none" onclick="watchAd()">📺 Watch Ad for Extra Life</button>
+</div>
+<div id="pauseMenu">⏸ PAUSED
+  <button id="resumeBtn" onclick="resumeGame()">▶ RESUME</button>
+  <button id="homeBtn" onclick="returnToHome()">🏠 RETURN TO HOME</button>
+</div>
+</div>
+<script>
+const C=document.getElementById('c'),ctx=C.getContext('2d');
+C.width=680;C.height=480;
+const W=C.width,H=C.height;
+const msg=document.getElementById('msg'),mtext=document.getElementById('mtext'),mbtn=document.getElementById('mbtn'),adBtn=document.getElementById('adBtn');
+const modeLivesBtn=document.getElementById('modeLivesBtn'),modeTimeBtn=document.getElementById('modeTimeBtn');
+const timeLimitRow=document.getElementById('timeLimitRow'),timeLimitInput=document.getElementById('timeLimitInput');
+const pauseMenu=document.getElementById('pauseMenu');
+let pauseMenuStartedAt=null;
+let gameMode='lives'; // 'lives' or 'time' — playtesting toggle, selectable any time the message overlay is showing
+const TIME_LIMIT_MS=120000; // fixed 2-minute limit for 'time' mode (adjustable via timeLimitInput, but only in debug mode)
+let timeLimitMs=TIME_LIMIT_MS;
+function setGameMode(mode){
+  gameMode=mode;
+  modeLivesBtn.classList.toggle('modeActive',mode==='lives');
+  modeTimeBtn.classList.toggle('modeActive',mode==='time');
+  timeLimitRow.style.display=(mode==='time'&&DEBUG_MODE)?'block':'none'; // adjustable time limit is a debug-only convenience, like the section-jump keybinds
+  adBtn.textContent=mode==='time'?'📺 Watch Ad for +20s':'📺 Watch Ad for Extra Life';
+}
+
+const GRAV=0.28,JUMP=-8.37,SPEED=2.6,ACCEL=0.32,FRIC=0.78,MAX_FALL=5;
+const KNOCKBACK_SPEED=11.71,KNOCKBACK_ANGLE=20*Math.PI/180; // 20° above horizontal
+const KNOCKBACK_VX=KNOCKBACK_SPEED*Math.cos(KNOCKBACK_ANGLE),KNOCKBACK_VY=KNOCKBACK_SPEED*Math.sin(KNOCKBACK_ANGLE);
+const WALL_L=30,WALL_R=W-30;
+const COYOTE=8,JBUF=8;
+const ARENA1_FLOOR=400,ARENA2_FLOOR=ARENA1_FLOOR-700,ARENA3_FLOOR=ARENA2_FLOOR-700;
+const PHASE6_FLOOR=ARENA3_FLOOR-700; // top of the final platforming section, where the boss rises to
+const NOSE_OFFSET_FROM_TOP=80;
+const PW=24; // design width, used for level/gap layout only
+const PLAYER_HITBOX_W=14; // actual collision width — narrower than sprite for fairer hits
+const INTERVAL_35=210; // 3.5s at 60fps
+const MAX_PLATFORM_GAP=40; // max horizontal distance between nearest edges of consecutive bottom-to-top platforms (arena + climb)
+const MIN_PLATFORM_DEVIATION=50; // min horizontal shift in *center* position between consecutive layers, so they can't stack directly on top of each other
+function deviatesFromAll(cands,refs){
+  for(let c of cands){
+    let cCenter=c.wx+c.w/2;
+    for(let r of refs){
+      if(Math.abs(cCenter-(r.wx+r.w/2))<MIN_PLATFORM_DEVIATION)return false;
+    }
+  }
+  return true;
+}
+function fallbackDeviatedX(w,refs){
+  // Tries every reference platform, in both directions, picking the first option that
+  // clears ALL of them (a layer can have 2 platforms, so checking just one isn't enough).
+  for(let anchor of refs){
+    for(let side of[1,-1]){
+      let targetCenter=anchor.wx+anchor.w/2+side*MIN_PLATFORM_DEVIATION;
+      let wx=Math.max(WALL_L+10,Math.min(W-WALL_L-10-w,targetCenter-w/2));
+      if(deviatesFromAll([{wx,w}],refs))return wx;
+    }
+  }
+  // Last resort (very rare): push twice as far from a random anchor
+  let anchor=refs[Math.floor(Math.random()*refs.length)],side=Math.random()<0.5?1:-1;
+  let targetCenter=anchor.wx+anchor.w/2+side*MIN_PLATFORM_DEVIATION*2;
+  return Math.max(WALL_L+10,Math.min(W-WALL_L-10-w,targetCenter-w/2));
+}
+const NUT_RADIUS=9; // nut body radius (2x its previous size)
+const DEBUG_MODE=true; // press 1-5 in-game to jump straight to any boss section
+
+// ── BEE HIVE (Arena 3 only) ────────────────────────────────────────────────────
+const HIVE_RADIUS=((52+64)/2)*(2/3); // was an oval (52,64) ~4x the fruit; now a circle at 2/3 that size (~38.7)
+const HIVE_PIVOT_OFFSET=20;  // how far below the top of the screen the pivot sits
+const HIVE_THETA_MAX=120*Math.PI/180; // swing amplitude (each side) — 240° total apex-to-apex arc
+const HIVE_MAX_SPEED=120;    // px/sec — tangential speed at the bottom of the swing
+const HIVE_DT=1/60;
+const HIVE_LENGTHS=[150,250,350]; // fixed pendulum-length presets, in px
+const HIVE_LEN_TRANS_FRAMES=480; // ease duration, counted only while near an apex (see updateHive)
+
+let camY=0,camYTarget=0,camLocked=true;
+function toDisp(wy){return wy-camY;}
+
+let P={wx:W/2,wy:ARENA1_FLOOR,vx:0,vy:0,w:PLAYER_HITBOX_W,h:36,
+  onGround:false,facing:1,coyote:0,jbuf:0,animFrame:0,animTimer:0,wasOnGround:false};
+
+let keys={},gameState='title';
+let audioCtx=null;
+function getAudioCtx(){
+  if(!audioCtx){
+    try{audioCtx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){return null;}
+  }
+  if(audioCtx.state==='suspended')audioCtx.resume();
+  return audioCtx;
+}
+function playBounceSound(vol=1){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    let osc=ctx.createOscillator(),gain=ctx.createGain();
+    osc.type='triangle';
+    osc.frequency.setValueAtTime(380,t);
+    osc.frequency.exponentialRampToValueAtTime(140,t+0.09);
+    gain.gain.setValueAtTime(0.18*vol,t);
+    gain.gain.exponentialRampToValueAtTime(0.001,t+0.12);
+    osc.connect(gain);gain.connect(ctx.destination);
+    osc.start(t);osc.stop(t+0.13);
+  }catch(e){/* audio blocked/unavailable — fail silently */}
+}
+
+// ── Shared synthesis helpers ────────────────────────────────────────────────────
+let _noiseBuffer=null;
+function getNoiseBuffer(ctx){
+  if(!_noiseBuffer||_noiseBuffer.sampleRate!==ctx.sampleRate){
+    let len=Math.floor(ctx.sampleRate*1);
+    _noiseBuffer=ctx.createBuffer(1,len,ctx.sampleRate);
+    let data=_noiseBuffer.getChannelData(0);
+    for(let i=0;i<len;i++)data[i]=Math.random()*2-1;
+  }
+  return _noiseBuffer;
+}
+function playTone(ctx,t,{type='sine',freqStart=300,freqEnd=150,duration=0.1,volume=0.18}={}){
+  let osc=ctx.createOscillator(),gain=ctx.createGain();
+  osc.type=type;
+  osc.frequency.setValueAtTime(freqStart,t);
+  osc.frequency.exponentialRampToValueAtTime(freqEnd,t+duration);
+  gain.gain.setValueAtTime(volume,t);
+  gain.gain.exponentialRampToValueAtTime(0.001,t+duration);
+  osc.connect(gain);gain.connect(ctx.destination);
+  osc.start(t);osc.stop(t+duration+0.02);
+}
+function playNoiseBurst(ctx,t,{duration=0.08,filterType='bandpass',filterFreq=1000,filterQ=1,volume=0.2}={}){
+  let src=ctx.createBufferSource();
+  src.buffer=getNoiseBuffer(ctx);
+  let filter=ctx.createBiquadFilter();filter.type=filterType;filter.frequency.value=filterFreq;filter.Q.value=filterQ;
+  let gain=ctx.createGain();
+  gain.gain.setValueAtTime(volume,t);
+  gain.gain.exponentialRampToValueAtTime(0.001,t+duration);
+  src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);
+  src.start(t);src.stop(t+duration+0.02);
+}
+const OBJECT_SOUND_MAX_DIST=350; // beyond this, nut/fruit sounds fade to silent
+function distToPlayer(wx,wy){let dx=wx-P.wx,dy=wy-(P.wy-P.h/2);return Math.sqrt(dx*dx+dy*dy);}
+function distanceVolumeScale(distance,maxDist){let t=Math.max(0,1-distance/maxDist);return t*t;} // full volume up close, quieter with distance
+
+// ── Nut sounds ───────────────────────────────────────────────────────────────
+function playThudSound(vol=1){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    playTone(ctx,t,{type:'sine',freqStart:150,freqEnd:55,duration:0.09,volume:0.22*vol});
+    playNoiseBurst(ctx,t,{duration:0.04,filterType:'lowpass',filterFreq:400,volume:0.08*vol});
+  }catch(e){}
+}
+function playNutCrackSound(vol=1){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    playNoiseBurst(ctx,t,{duration:0.06,filterType:'highpass',filterFreq:1800,filterQ:0.8,volume:0.22*vol});
+    playTone(ctx,t,{type:'square',freqStart:900,freqEnd:300,duration:0.04,volume:0.08*vol});
+  }catch(e){}
+}
+function startTumbleSound(n){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx||n._tumbleSrc)return;
+  try{
+    let src=ctx.createBufferSource();
+    src.buffer=getNoiseBuffer(ctx);src.loop=true;
+    let filter=ctx.createBiquadFilter();filter.type='lowpass';filter.frequency.value=900;filter.Q.value=0.5;
+    let gain=ctx.createGain();gain.gain.value=0; // distance-driven, corrected the same frame
+    src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);
+    src.start();
+    n._tumbleSrc=src;n._tumbleGain=gain;
+  }catch(e){}
+}
+function updateTumbleVolume(n,distance){
+  if(!n._tumbleGain)return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  const BASE_GAIN=0.012;
+  n._tumbleGain.gain.setTargetAtTime(BASE_GAIN*distanceVolumeScale(distance,OBJECT_SOUND_MAX_DIST),ctx.currentTime,0.08);
+}
+function stopTumbleSound(n){
+  if(!n._tumbleSrc)return;
+  try{
+    let ctx=getAudioCtx();
+    if(ctx){let t=ctx.currentTime;n._tumbleGain.gain.setTargetAtTime(0.0001,t,0.02);n._tumbleSrc.stop(t+0.06);}
+    else n._tumbleSrc.stop();
+  }catch(e){}
+  n._tumbleSrc=null;n._tumbleGain=null;
+}
+function stopAllTumbleSounds(){for(let n of nuts)stopTumbleSound(n);}
+
+// ── Branch sounds ────────────────────────────────────────────────────────────
+function playSproutSound(){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime+Math.random()*0.04;
+    playTone(ctx,t,{type:'sine',freqStart:220,freqEnd:520,duration:0.16,volume:0.1});
+  }catch(e){}
+}
+function playSnapSound(){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime+Math.random()*0.04;
+    playTone(ctx,t,{type:'triangle',freqStart:200,freqEnd:80,duration:0.07,volume:0.16});
+    playNoiseBurst(ctx,t,{duration:0.05,filterType:'bandpass',filterFreq:1200,filterQ:1.2,volume:0.18});
+  }catch(e){}
+}
+
+// ── Fruit sounds ─────────────────────────────────────────────────────────────
+function playFruitCrackSound(vol=1){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    playNoiseBurst(ctx,t,{duration:0.1,filterType:'lowpass',filterFreq:700,filterQ:0.7,volume:0.22*vol});
+    playTone(ctx,t,{type:'sine',freqStart:260,freqEnd:90,duration:0.1,volume:0.12*vol});
+  }catch(e){}
+}
+
+// ── Weakspot sound ───────────────────────────────────────────────────────────
+function playPunchSound(){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    playTone(ctx,t,{type:'square',freqStart:220,freqEnd:45,duration:0.14,volume:0.4}); // big punchy "POW" body
+    playNoiseBurst(ctx,t,{duration:0.05,filterType:'bandpass',filterFreq:2200,filterQ:0.9,volume:0.35}); // sharp smack/crack
+    playTone(ctx,t,{type:'square',freqStart:900,freqEnd:600,duration:0.02,volume:0.22}); // tiny extra click for snap
+  }catch(e){}
+}
+
+// ── Player sound ─────────────────────────────────────────────────────────────
+function playPlayerHurtSound(){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    playTone(ctx,t,{type:'sawtooth',freqStart:1200,freqEnd:700,duration:0.03,volume:0.2}); // sharp initial sting
+    playTone(ctx,t,{type:'sawtooth',freqStart:500,freqEnd:110,duration:0.16,volume:0.42}); // harsh descending "yelp"
+    playNoiseBurst(ctx,t,{duration:0.07,filterType:'bandpass',filterFreq:1600,filterQ:0.7,volume:0.32}); // gritty impact
+  }catch(e){}
+}
+
+// ── Hive sounds ──────────────────────────────────────────────────────────────
+let hiveSwingSrc=null,hiveSwingGain=null;
+function startHiveSwingSound(){
+  stopHiveSwingSound();
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let src=ctx.createBufferSource();
+    src.buffer=getNoiseBuffer(ctx);src.loop=true;
+    let filter=ctx.createBiquadFilter();filter.type='bandpass';filter.frequency.value=500;filter.Q.value=0.8;
+    let gain=ctx.createGain();gain.gain.value=0; // distance-driven, starts silent
+    src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);
+    src.start();
+    hiveSwingSrc=src;hiveSwingGain=gain;
+  }catch(e){}
+}
+function stopHiveSwingSound(){
+  if(!hiveSwingSrc)return;
+  try{
+    let ctx=getAudioCtx();
+    if(ctx){let t=ctx.currentTime;hiveSwingGain.gain.setTargetAtTime(0.0001,t,0.03);hiveSwingSrc.stop(t+0.08);}
+    else hiveSwingSrc.stop();
+  }catch(e){}
+  hiveSwingSrc=null;hiveSwingGain=null;
+}
+function updateHiveSwingVolume(distance){
+  if(!hiveSwingGain)return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  const MAX_DIST=400,MAX_GAIN=0.18;
+  let t=Math.max(0,1-distance/MAX_DIST);
+  hiveSwingGain.gain.setTargetAtTime(MAX_GAIN*t*t,ctx.currentTime,0.08); // smooth glide, quieter far away, louder up close
+}
+
+// Continuous low rumble + slowly rising creak/groan, spanning the whole shake+rise cinematic
+let growSrc=null,growGain=null,growOsc=null,growOscGain=null;
+function startTreeGrowSound(){
+  stopTreeGrowSound();
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let src=ctx.createBufferSource();
+    src.buffer=getNoiseBuffer(ctx);src.loop=true;
+    let filter=ctx.createBiquadFilter();filter.type='lowpass';filter.frequency.value=140;filter.Q.value=0.6;
+    let gain=ctx.createGain();gain.gain.value=0.0001;
+    src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);
+    src.start();
+    gain.gain.setTargetAtTime(0.22,ctx.currentTime,0.25); // fade in the ground-shaking rumble
+
+    let osc=ctx.createOscillator();osc.type='triangle';osc.frequency.value=55;
+    let oscGain=ctx.createGain();oscGain.gain.value=0.0001;
+    osc.connect(oscGain);oscGain.connect(ctx.destination);
+    osc.start();
+    oscGain.gain.setTargetAtTime(0.07,ctx.currentTime,0.25);
+    osc.frequency.setTargetAtTime(95,ctx.currentTime+0.2,2.6); // slow upward creak, like the trunk growing taller
+
+    growSrc=src;growGain=gain;growOsc=osc;growOscGain=oscGain;
+  }catch(e){}
+}
+function stopTreeGrowSound(){
+  if(!growSrc)return;
+  try{
+    let ctx=getAudioCtx();
+    if(ctx){
+      let t=ctx.currentTime;
+      growGain.gain.setTargetAtTime(0.0001,t,0.2);growOscGain.gain.setTargetAtTime(0.0001,t,0.2);
+      growSrc.stop(t+0.4);growOsc.stop(t+0.4);
+    } else {growSrc.stop();growOsc.stop();}
+  }catch(e){}
+  growSrc=null;growGain=null;growOsc=null;growOscGain=null;
+}
+
+// Quiet leaf/branch rustle, for the brief shake-warning before the weakspot rises (final section)
+let rustleSrc=null,rustleGain=null;
+function startRustleSound(){
+  stopRustleSound();
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let src=ctx.createBufferSource();
+    src.buffer=getNoiseBuffer(ctx);src.loop=true;
+    let filter=ctx.createBiquadFilter();filter.type='bandpass';filter.frequency.value=2800;filter.Q.value=0.7;
+    let gain=ctx.createGain();gain.gain.value=0.0001;
+    src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);
+    src.start();
+    gain.gain.setTargetAtTime(0.1,ctx.currentTime,0.08);
+    rustleSrc=src;rustleGain=gain;
+  }catch(e){}
+}
+function stopRustleSound(){
+  if(!rustleSrc)return;
+  try{
+    let ctx=getAudioCtx();
+    if(ctx){let t=ctx.currentTime;rustleGain.gain.setTargetAtTime(0.0001,t,0.08);rustleSrc.stop(t+0.2);}
+    else rustleSrc.stop();
+  }catch(e){}
+  rustleSrc=null;rustleGain=null;
+}
+function playHiveDestroySound(){
+  if(gameState!=='playing')return;
+  let ctx=getAudioCtx();if(!ctx)return;
+  try{
+    let t=ctx.currentTime;
+    playTone(ctx,t,{type:'sine',freqStart:180,freqEnd:40,duration:0.22,volume:0.38}); // big low impact boom
+    playNoiseBurst(ctx,t,{duration:0.16,filterType:'lowpass',filterFreq:900,filterQ:0.6,volume:0.3}); // crumbling shell/wax
+    playNoiseBurst(ctx,t+0.04,{duration:0.18,filterType:'bandpass',filterFreq:3000,filterQ:2,volume:0.16}); // bees scattering
+  }catch(e){}
+}
+let phase=1,subPhase=0,bossHp=9,totalHits=0,playerHp=3;
+let frameCount=0,nutTimer=0,hitFlash=0,playerInvuln=0,playerStun=0,noseInvuln=0,pendingGameOver=false;
+let altWaveIsNuts=true; // toggled each alternating wave so consecutive ones alternate 2-nuts/2-fruits
+let particles=[],platforms=[],spikePatch=[],nuts=[],fruits=[],branches=[],scrollWPs=[];
+let bossNose={wx:0,wy:0,w:60,h:40};
+let platRespawnTimer=0,platRespawnPending=false,platRespawnIsClimb=false;
+let gameStartTime=0,elapsedTime=0,totalPlayerHits=0;
+let pausedMs=0,pauseStartedAt=null,deathStartedAt=null;
+function isTimerPaused(){return platRespawnPending||bossShaking||bossRising;}
+function getAdjustedElapsedMs(){
+  let nowRef=pauseStartedAt!==null?pauseStartedAt:performance.now();
+  return nowRef-gameStartTime-pausedMs;
+}
+let leafTelegraphs=[];
+const TELEGRAPH_FRAMES=50;
+let mobileKeys={left:false,right:false,jump:false};
+let bossRising=false,bossRiseProgress=0,bossRiseFromFloor=0,bossRiseToFloor=0,pendingClimbPhase=0;
+let noseRiseFromY=0,noseRiseToY=0;
+const BOSS_RISE_FRAMES=120; // 2s, dramatic rise off the top of the screen
+let bossShaking=false,bossShakeTimer=0;
+const TREE_SHAKE_FRAMES=90; // 1.5s of shaking before the rise begins
+let phase6Hits=0,phase6NoseSeen=false,phase6RiseTimer=0,phase6LastPlatforms=null,phase6CanopyRise=0;
+let phase6Telegraphing=false,phase6TelegraphTimer=0;
+const PHASE6_RISE_STEP=100,PHASE6_RISE_INTERVAL=210; // the weakspot flees 100px higher every 3.5s after the first (immediate) rise
+const PHASE6_TELEGRAPH_FRAMES=90; // 1.5s shake warning before each rise
+let spawningEnabled=true;
+let hive=null;
+
+function rectOverlap(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;}
+function lerpColor(c1,c2,t){
+  let r1=parseInt(c1.slice(1,3),16),g1=parseInt(c1.slice(3,5),16),b1=parseInt(c1.slice(5,7),16);
+  let r2=parseInt(c2.slice(1,3),16),g2=parseInt(c2.slice(3,5),16),b2=parseInt(c2.slice(5,7),16);
+  let r=Math.round(r1+(r2-r1)*t),g=Math.round(g1+(g2-g1)*t),b=Math.round(b1+(b2-b1)*t);
+  return `rgb(${r},${g},${b})`;
+}
+function pRect(){return{x:P.wx-P.w/2,y:P.wy-P.h,w:P.w,h:P.h};}
+
+function arenaLayout(floorY){
+  let noseWorldY=floorY-H+NOSE_OFFSET_FROM_TOP;
+  let topPlatY=noseWorldY+80,firstPlatY=floorY-100;
+  return{noseWorldY,topPlatY,firstPlatY};
+}
+
+// ── BEE HIVE ───────────────────────────────────────────────────────────────────
+function initHive(pivotWy=ARENA3_FLOOR-H+HIVE_PIVOT_OFFSET){
+  let startLen=phase===6
+    ? phase6LengthCandidates(pivotWy)[Math.floor(Math.random()*3)]
+    : HIVE_LENGTHS[Math.floor(Math.random()*HIVE_LENGTHS.length)];
+  let side=Math.random()<0.5?1:-1; // randomly start at the left or right apex
+  let startPhi=side*Math.PI/2,theta0=side*HIVE_THETA_MAX;
+  hive={
+    pivotWx:W/2,pivotWy,
+    len:startLen,
+    phi:startPhi,phi0:startPhi, // start exactly at an apex (turning point), not mid-swing
+    transitioning:false,armedThisSwing:false,
+    transFromLen:startLen,transTargetLen:startLen,transActiveFrames:0,
+    wx:W/2+startLen*Math.sin(theta0),
+    wy:pivotWy+startLen*Math.cos(theta0)
+  };
+  startHiveSwingSound();
+}
+
+function hiveOmega(len){
+  let speed=(phase===5||phase===6)?HIVE_MAX_SPEED+0.25*(len-150):HIVE_MAX_SPEED; // longer pendulum = faster swing, in both hive sections
+  return speed/(len*HIVE_THETA_MAX);
+}
+function phase6LengthCandidates(pivotWy){
+  let dist=Math.max(0,P.wy-pivotWy); // how far below the hinge the player currently is
+  return [dist,dist-100,dist-200].map(v=>Math.max(150,v)); // 0/100/200px less than that distance, with a 150px floor
+}
+
+function updateHive(){
+  if(!hive)return;
+  if(phase===6)hive.pivotWy=bossNose.wy-60; // hinge always hangs a fixed distance above the weakspot, which itself can move during the chase
+  // Angular speed is derived from the *current* radius every frame (not a separately
+  // tracked snapshot), so tangential speed at the bottom of the swing stays pinned to
+  // HIVE_MAX_SPEED at all times — including mid length-change.
+  let omega=hiveOmega(hive.len);
+  hive.phi+=omega*HIVE_DT;
+  if(hive.phi-hive.phi0>=Math.PI){ // one swing (apex-to-apex) complete
+    hive.phi0+=Math.PI;
+    hive.armedThisSwing=false;
+  }
+  let progress=(hive.phi-hive.phi0)/Math.PI;
+  let nearApex=progress>=0.75||progress<0.25; // the swing is slow/stationary here — safe to change length
+  if(!hive.transitioning&&nearApex&&!hive.armedThisSwing){
+    hive.armedThisSwing=true;hive.transitioning=true;
+    hive.transFromLen=hive.len;
+    let candidates=phase===6?phase6LengthCandidates(hive.pivotWy):HIVE_LENGTHS.filter(l=>l!==hive.len); // never repeat the current length (arena only)
+    hive.transTargetLen=candidates[Math.floor(Math.random()*candidates.length)];
+    hive.transActiveFrames=0;
+  }
+  if(hive.transitioning&&nearApex){
+    // Active-frame counter only advances while near an apex, so the ease can never get
+    // "stuck" mid-fast-swing waiting for the next window, and length changes never
+    // overlap the fast part of the swing (which is what previously caused speed spikes).
+    hive.transActiveFrames++;
+    let bf=hive.transActiveFrames/HIVE_LEN_TRANS_FRAMES;
+    if(bf>=1){bf=1;hive.transitioning=false;}
+    let eased=bf<0.5?2*bf*bf:1-Math.pow(-2*bf+2,2)/2; // ease in-out
+    hive.len=hive.transFromLen+(hive.transTargetLen-hive.transFromLen)*eased;
+  }
+  let theta=HIVE_THETA_MAX*Math.sin(hive.phi);
+  hive.wx=hive.pivotWx+hive.len*Math.sin(theta);
+  hive.wy=hive.pivotWy+hive.len*Math.cos(theta);
+  // Continuous swing loop: louder the closer the hive is to the player, quieter the farther away
+  let dxp=hive.wx-P.wx,dyp=hive.wy-(P.wy-P.h/2),distp=Math.sqrt(dxp*dxp+dyp*dyp);
+  updateHiveSwingVolume(distp);
+}
+
+// ── SPIKE PATCHES ─────────────────────────────────────────────────────────────
+// spikePatch entries: {wx, wy, onTop} — wy is world y of spike base
+function buildSpikesForPlatform(pl){
+  // One spike (10px wide) on top only
+  let topX=pl.wx+40+Math.random()*Math.max(0,pl.w-10-80);
+  spikePatch.push({wx:topX,wy:pl.wy-pl.h,onTop:true,w:10});
+}
+
+// ── PLATFORM BUILDERS ─────────────────────────────────────────────────────────
+function spawnArenaLayer(wy,thorned,belowPlats,addSpikes){
+  const MAX_TRIES=40;
+  let w=120+Math.random()*100,wx,ok=false;
+  for(let t=0;t<MAX_TRIES;t++){
+    wx=WALL_L+10+Math.random()*(W-WALL_L*2-w-20);
+    if(!belowPlats||belowPlats.length===0){ok=true;break;}
+    let newL=wx,newR=wx+w;ok=true;
+    for(let bp of belowPlats){
+      let bL=bp.wx,bR=bp.wx+bp.w;
+      if(newL<=bL&&newR>=bR){ok=false;break;}
+      let gap=Math.max(bL-newR,newL-bR,0);
+      if(gap>MAX_PLATFORM_GAP){ok=false;break;}
+    }
+    if(ok&&!deviatesFromAll([{wx,w}],belowPlats))ok=false;
+    if(ok)break;
+  }
+  if(!ok&&belowPlats&&belowPlats.length){
+    // Guaranteed-valid fallback that also checks every reference platform, not just one
+    wx=fallbackDeviatedX(w,belowPlats);
+  }
+  let pl={wx,wy,w,h:14,thorned:false,arena:true};
+  platforms.push(pl);
+  spawnParticles(pl.wx+pl.w/2,toDisp(pl.wy-pl.h/2),'#4a9030',6);playSproutSound();
+  if(addSpikes)buildSpikesForPlatform(pl);
+  return pl;
+}
+
+function buildArenaLayersFor(floorY,addSpikes){
+  let{noseWorldY,topPlatY,firstPlatY}=arenaLayout(floorY);
+  bossNose.wx=W/2;bossNose.wy=noseWorldY;
+  let y=firstPlatY,prev=null;
+  while(y>=topPlatY){
+    let pl=spawnArenaLayer(y,false,prev,addSpikes);
+    prev=[pl];y-=100;
+  }
+}
+
+function clearArenaLayers(){
+  for(let p of platforms){if(p.arena){spawnParticles(p.wx+p.w/2,toDisp(p.wy-p.h/2),'#5a3a10',8);playSnapSound();}}
+  platforms=platforms.filter(p=>!p.arena);
+  spikePatch=[];
+}
+
+function clearPhase6Layers(){
+  // Every platform in phase 6 belongs to this one structure (none are tagged arena:true),
+  // so unlike clearArenaLayers, this wipes everything rather than filtering by tag.
+  for(let p of platforms){spawnParticles(p.wx+p.w/2,toDisp(p.wy-p.h/2),'#5a3a10',8);playSnapSound();}
+  platforms=[];
+  spikePatch=[];
+}
+function respawnArenaLayers(addSpikes){buildArenaLayersFor(currentFloorY(),addSpikes);spawningEnabled=true;}
+
+function climbLayerValid(newPlats,belowPlats){
+  if(!belowPlats||belowPlats.length===0)return true;
+  for(let np of newPlats){
+    let nL=np.wx,nR=np.wx+np.w;
+    for(let bp of belowPlats){
+      let bL=bp.wx,bR=bp.wx+bp.w;
+      if(nL<=bL&&nR>=bR)return false;
+      let gap=Math.max(bL-nR,nL-bR,0);
+      if(gap>MAX_PLATFORM_GAP)return false;
+    }
+  }
+  if(!deviatesFromAll(newPlats,belowPlats))return false;
+  return true;
+}
+
+function buildClimbLayers(topY,bottomY,addSpikes){
+  const MAX_TRIES=40;
+  let y=bottomY-100,prev=null;
+  while(y>topY){
+    let count=Math.random()<0.5?1:2,chosen=null;
+    for(let t=0;t<MAX_TRIES;t++){
+      let cands=[];
+      if(count===1){
+        let w=100+Math.random()*100,wx=WALL_L+10+Math.random()*(W-WALL_L*2-w-20);
+        cands.push({wx,wy:y,w,h:14,thorned:false,arena:false});
+      } else {
+        let gapMin=PW*2+16,gapMax=PW*3+20,gap=gapMin+Math.random()*(gapMax-gapMin);
+        let totalW=W-WALL_L*2-gap-20,w1=60+Math.random()*60,w2=Math.max(60,Math.min(140,totalW-w1));
+        let gapX=WALL_L+10+w1;
+        gapX=Math.max(WALL_L+10+w1,Math.min(W-WALL_L-10-w2-gap,gapX+Math.random()*80-40));
+        cands.push({wx:gapX-w1,wy:y,w:w1,h:14,thorned:false,arena:false});
+        cands.push({wx:gapX+gap,wy:y,w:w2,h:14,thorned:false,arena:false});
+      }
+      if(climbLayerValid(cands,prev)){chosen=cands;break;}
+    }
+    if(!chosen){
+      let w=120;
+      let wx;
+      if(prev&&prev.length){
+        // Guaranteed-valid fallback that also checks every reference platform, not just one
+        wx=fallbackDeviatedX(w,prev);
+      } else {
+        wx=WALL_L+10+Math.random()*(W-WALL_L*2-w-20);
+      }
+      chosen=[{wx,wy:y,w,h:14,thorned:false,arena:false}];
+    }
+    for(let p of chosen){platforms.push(p);spawnParticles(p.wx+p.w/2,toDisp(p.wy-p.h/2),'#4a9030',6);playSproutSound();if(addSpikes)buildSpikesForPlatform(p);}
+    prev=chosen;y-=100;
+  }
+  return prev;
+}
+
+// ── INIT ──────────────────────────────────────────────────────────────────────
+function startGame(){
+  getAudioCtx(); // unlock audio on this user gesture so sounds can play during the run
+  gameState='playing';msg.style.display='none';adBtn.style.display='none';pauseMenu.style.display='none';pauseMenuStartedAt=null;
+  if(gameMode==='time')timeLimitMs=DEBUG_MODE?Math.max(10,parseInt(timeLimitInput.value)||120)*1000:TIME_LIMIT_MS;
+  phase=1;subPhase=0;bossHp=12;totalHits=0;playerHp=3;
+  frameCount=0;nutTimer=0;hitFlash=0;playerInvuln=0;playerStun=0;noseInvuln=0;pendingGameOver=false;
+  platRespawnTimer=0;platRespawnPending=false;platRespawnIsClimb=false;
+  bossShaking=false;bossShakeTimer=0;bossRising=false;bossRiseProgress=0;pendingClimbPhase=0;
+  phase6Hits=0;phase6NoseSeen=false;phase6RiseTimer=0;phase6Telegraphing=false;phase6TelegraphTimer=0;phase6LastPlatforms=null;
+  stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+  particles=[];platforms=[];spikePatch=[];nuts=[];fruits=[];branches=[];scrollWPs=[];leafTelegraphs=[];hive=null;
+  camY=ARENA1_FLOOR-H;camYTarget=camY;camLocked=true;
+  P.wx=W/2;P.wy=ARENA1_FLOOR-P.h;P.vx=0;P.vy=0;P.onGround=false;P.wasOnGround=false;
+  gameStartTime=performance.now();elapsedTime=0;totalPlayerHits=0;pausedMs=0;pauseStartedAt=null;deathStartedAt=null;
+  buildArenaLayersFor(ARENA1_FLOOR,false);
+}
+
+function openPauseMenu(){
+  if(gameState!=='playing')return;
+  elapsedTime=getAdjustedElapsedMs();
+  gameState='paused';
+  pauseMenuStartedAt=performance.now();
+  pauseMenu.style.display='block';
+}
+function resumeGame(){
+  if(gameState!=='paused')return;
+  if(pauseMenuStartedAt!==null){pausedMs+=performance.now()-pauseMenuStartedAt;pauseMenuStartedAt=null;} // the entire paused-menu duration shouldn't count against elapsed/remaining time
+  pauseMenu.style.display='none';
+  gameState='playing';
+}
+function returnToHome(){
+  pauseMenuStartedAt=null;
+  pauseMenu.style.display='none';
+  stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+  gameState='title';
+  msg.style.display='block';
+  mtext.innerHTML='🌳 THE GREAT TREE 🌳<br><small style="font-size:14px">Hit the glowing nose fruit to deal damage!<br>Use platforms to climb!</small>';
+  mbtn.textContent='START';adBtn.style.display='none';
+}
+
+function watchAd(){
+  adBtn.textContent='📺 Watching ad...';adBtn.disabled=true;
+  setTimeout(()=>{
+    if(deathStartedAt!==null){pausedMs+=performance.now()-deathStartedAt;deathStartedAt=null;} // the entire death-screen-to-resume gap shouldn't count against elapsed/remaining time
+    if(gameMode==='time'){
+      timeLimitMs+=20000; // no invincibility frames in this mode, per spec
+    } else {
+      playerHp=1;playerInvuln=360;
+    }
+    gameState='playing';msg.style.display='none';adBtn.style.display='none';adBtn.disabled=false;
+    adBtn.textContent=gameMode==='time'?'📺 Watch Ad for +20s':'📺 Watch Ad for Extra Life';
+  },3000);
+}
+
+function currentFloorY(){
+  if(phase<=2)return ARENA1_FLOOR;
+  if(phase<=4)return ARENA2_FLOOR;
+  return ARENA3_FLOOR;
+}
+
+// ── HIT LOGIC ─────────────────────────────────────────────────────────────────
+function triggerHit(){
+  if(noseInvuln>0)return;
+  noseInvuln=90;hitFlash=20;bossHp--;totalHits++;
+  playPunchSound();
+  spawnParticles(bossNose.wx,toDisp(bossNose.wy),'#ff6',12);
+  for(let n of nuts){spawnParticles(n.wx,toDisp(n.wy-NUT_RADIUS),'#d9a866',8);stopTumbleSound(n);playNutCrackSound(distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST));}
+  for(let f of fruits){spawnParticles(f.wx,toDisp(f.wy-12),'#e05050',10);playFruitCrackSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));}
+  clearArenaLayers();nuts=[];fruits=[];leafTelegraphs=[];nutTimer=0;spawningEnabled=false;if(phase===5&&hive){spawnParticles(hive.wx,toDisp(hive.wy),'#8fc04a',18);playHiveDestroySound();stopHiveSwingSound();hive=null;}  let arenaHits=phase===1?totalHits:phase===3?totalHits-3:totalHits-6;
+  let hitsNeeded=3;
+  if(arenaHits>=hitsNeeded){    platRespawnPending=true;platRespawnTimer=0;platRespawnIsClimb=true;
+  } else {
+    subPhase=arenaHits;platRespawnPending=true;platRespawnTimer=0;platRespawnIsClimb=false;
+  }
+}
+
+function triggerPhase6Hit(){
+  if(noseInvuln>0)return;
+  noseInvuln=90;hitFlash=20;bossHp--;
+  playPunchSound();
+  spawnParticles(bossNose.wx,toDisp(bossNose.wy),'#ff6',12);
+  phase6Hits++;
+  if(phase6Hits>=3){triggerWin();return;}
+  for(let n of nuts){spawnParticles(n.wx,toDisp(n.wy-NUT_RADIUS),'#d9a866',8);stopTumbleSound(n);playNutCrackSound(distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST));}
+  for(let f of fruits){spawnParticles(f.wx,toDisp(f.wy-12),'#e05050',10);playFruitCrackSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));}
+  nuts=[];fruits=[];leafTelegraphs=[];nutTimer=0;spawningEnabled=false;
+  if(hive){spawnParticles(hive.wx,toDisp(hive.wy),'#8fc04a',18);playHiveDestroySound();stopHiveSwingSound();hive=null;}
+  clearPhase6Layers();
+  platRespawnPending=true;platRespawnTimer=0;platRespawnIsClimb=false;
+}
+
+function respawnPhase6Layers(){
+  phase6LastPlatforms=buildClimbLayers(PHASE6_FLOOR,ARENA3_FLOOR,true);
+  bossNose.wx=W/2;bossNose.wy=PHASE6_FLOOR-30; // back to its original spot for a fresh climb
+  initHive(bossNose.wy-60); // hinge hangs a fixed distance above the weakspot (tracked dynamically from here on, see updateHive)
+  phase6NoseSeen=false;phase6RiseTimer=0;phase6Telegraphing=false;phase6TelegraphTimer=0; // the chase-on-final-hit logic resets along with everything else
+  spawningEnabled=true;
+}
+
+function doPhase6Rise(){
+  bossNose.wy-=PHASE6_RISE_STEP;
+  phase6CanopyRise+=PHASE6_RISE_STEP;
+  if(hive){
+    // The hinge rises with the weakspot (see updateHive), but the durian itself shouldn't
+    // jerk upward with it — let the pendulum effectively get longer by the same amount instead.
+    hive.len+=PHASE6_RISE_STEP;
+    hive.transFromLen+=PHASE6_RISE_STEP;
+    hive.transTargetLen+=PHASE6_RISE_STEP;
+  }
+  let y=phase6LastPlatforms[0].wy-100; // always exactly 100px above the last platform layer placed
+  const MAX_TRIES=40;
+  let cands=null;
+  for(let t=0;t<MAX_TRIES;t++){
+    let count=Math.random()<0.5?1:2,tryCands=[];
+    if(count===1){
+      let w=100+Math.random()*100,wx=WALL_L+10+Math.random()*(W-WALL_L*2-w-20);
+      tryCands.push({wx,wy:y,w,h:14,thorned:false,arena:false});
+    } else {
+      let gapMin=PW*2+16,gapMax=PW*3+20,gap=gapMin+Math.random()*(gapMax-gapMin);
+      let totalW=W-WALL_L*2-gap-20,w1=60+Math.random()*60,w2=Math.max(60,Math.min(140,totalW-w1));
+      let gapX=WALL_L+10+w1;
+      gapX=Math.max(WALL_L+10+w1,Math.min(W-WALL_L-10-w2-gap,gapX+Math.random()*80-40));
+      tryCands.push({wx:gapX-w1,wy:y,w:w1,h:14,thorned:false,arena:false});
+      tryCands.push({wx:gapX+gap,wy:y,w:w2,h:14,thorned:false,arena:false});
+    }
+    if(climbLayerValid(tryCands,phase6LastPlatforms)){cands=tryCands;break;}
+  }
+  if(!cands){
+    // Guaranteed-deviated fallback, same pattern as the other generators
+    let w=120,wx=fallbackDeviatedX(w,phase6LastPlatforms);
+    cands=[{wx,wy:y,w,h:14,thorned:false,arena:false}];
+  }
+  phase6LastPlatforms=cands;
+  for(let p of cands){platforms.push(p);spawnParticles(p.wx+p.w/2,toDisp(p.wy-p.h/2),'#4a9030',6);playSproutSound();buildSpikesForPlatform(p);}
+}
+
+function updatePhase6Chase(){
+  if(phase6Hits<2||platRespawnPending)return; // waits for the post-hit landing+reset to fully complete first
+  let noseDispY=toDisp(bossNose.wy);
+  let inView=noseDispY>=-bossNose.h&&noseDispY<=H;
+  if(phase6Telegraphing){
+    if(!inView)return; // holds mid-telegraph if it somehow leaves view, same as the rise timer does
+    phase6TelegraphTimer++;
+    if(phase6TelegraphTimer>=PHASE6_TELEGRAPH_FRAMES){phase6Telegraphing=false;stopRustleSound();doPhase6Rise();}
+    return;
+  }
+  if(!phase6NoseSeen){
+    if(inView){phase6NoseSeen=true;phase6RiseTimer=0;phase6Telegraphing=true;phase6TelegraphTimer=0;startRustleSound();} // rises immediately (after a brief telegraph) the first time it's seen
+    return;
+  }
+  if(!inView)return; // out of view: the rise timer holds where it is instead of advancing
+  phase6RiseTimer++;
+  if(phase6RiseTimer>=PHASE6_RISE_INTERVAL){
+    phase6RiseTimer=0;
+    phase6Telegraphing=true;phase6TelegraphTimer=0;startRustleSound(); // telegraph before every subsequent rise too
+  }
+}
+
+function beginClimb(p){
+  stopAllTumbleSounds();
+  phase=p;subPhase=0;nuts=[];fruits=[];leafTelegraphs=[];nutTimer=0;camLocked=false;
+  let topY=p===2?ARENA2_FLOOR:ARENA3_FLOOR,botY=p===2?ARENA1_FLOOR:ARENA2_FLOOR;
+  buildClimbLayers(topY,botY,p===4);scrollWPs=[];
+  spawningEnabled=true;
+}
+
+function arriveAtArena(p){
+  stopAllTumbleSounds();
+  phase=p;subPhase=0;scrollWPs=[];nuts=[];fruits=[];leafTelegraphs=[];nutTimer=0;camLocked=true;
+  let floorY=p===3?ARENA2_FLOOR:ARENA3_FLOOR;
+  camYTarget=floorY-H;camY=camYTarget;
+  platforms=platforms.filter(pl=>!pl.arena);spikePatch=[];
+  buildArenaLayersFor(floorY,true); // thorns from the very start in both arenas now
+  spawningEnabled=true;
+  P.wy=floorY-P.h-2;P.vx=0;P.vy=0;noseInvuln=0;
+  if(p===5)initHive();else{stopHiveSwingSound();hive=null;}
+}
+
+function beginTreeRiseSequence(toFloor,nextPhase){
+  // The current arena is cleared. The tree shakes and rears up to reveal the next section.
+  bossShaking=true;bossShakeTimer=0;
+  startTreeGrowSound();
+  bossRiseFromFloor=currentFloorY();bossRiseToFloor=toFloor;
+  pendingClimbPhase=nextPhase;
+  noseRiseFromY=bossNose.wy;
+  noseRiseToY=nextPhase===6?(PHASE6_FLOOR-30):arenaLayout(toFloor).noseWorldY;
+}
+
+function beginPhase6(){
+  stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+  phase=6;subPhase=0;nuts=[];fruits=[];leafTelegraphs=[];nutTimer=0;camLocked=false;
+  phase6Hits=0;phase6NoseSeen=false;phase6RiseTimer=0;phase6Telegraphing=false;phase6TelegraphTimer=0;
+  phase6LastPlatforms=buildClimbLayers(PHASE6_FLOOR,ARENA3_FLOOR,true); // thorns on every platform up the final climb
+  scrollWPs=[];
+  // buildClimbLayers' topmost platform lands at PHASE6_FLOOR+100; put the weakspot one
+  // standard jump (~130px, matching the regular arena's platform-to-nose gap) above that.
+  bossNose.wx=W/2;bossNose.wy=PHASE6_FLOOR-30;
+  initHive(bossNose.wy-60); // hinge hangs a fixed distance above the weakspot (tracked dynamically from here on, see updateHive)
+  spawningEnabled=true;
+}
+
+function formatTime(ms){let s=Math.floor(ms/1000),m=Math.floor(s/60);s=s%60;return`${m}:${String(s).padStart(2,'0')}`;}
+
+// ── DEBUG: jump straight to any section ────────────────────────────────────────
+// 1=Arena1  2=Climb1  3=Arena2  4=Climb2  5=Arena3  6=FinalClimb
+function debugGoto(target){
+  if(!DEBUG_MODE)return;
+  // Reset shared run-state so every jump starts clean, regardless of where we were
+  gameState='playing';msg.style.display='none';adBtn.style.display='none';pauseMenu.style.display='none';pauseMenuStartedAt=null;
+  playerHp=3;playerInvuln=0;playerStun=0;pendingGameOver=false;hitFlash=0;noseInvuln=0;
+  bossRising=false;bossRiseProgress=0;bossShaking=false;bossShakeTimer=0;pendingClimbPhase=0;
+  phase6Hits=0;phase6NoseSeen=false;phase6RiseTimer=0;phase6Telegraphing=false;phase6TelegraphTimer=0;phase6LastPlatforms=null;
+  stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+  particles=[];nuts=[];fruits=[];leafTelegraphs=[];nutTimer=0;
+  platforms=[];spikePatch=[];scrollWPs=[];
+  platRespawnPending=false;platRespawnTimer=0;platRespawnIsClimb=false;
+  spawningEnabled=true;totalPlayerHits=0;gameStartTime=performance.now();elapsedTime=0;pausedMs=0;pauseStartedAt=null;deathStartedAt=null;
+
+  if(target===1){
+    bossHp=12;totalHits=0;hive=null;
+    camY=ARENA1_FLOOR-H;camYTarget=camY;camLocked=true;
+    P.wx=W/2;P.wy=ARENA1_FLOOR-P.h;P.vx=0;P.vy=0;P.onGround=false;P.wasOnGround=false;
+    buildArenaLayersFor(ARENA1_FLOOR,false);
+    phase=1;subPhase=0;
+  } else if(target===2){
+    bossHp=9;totalHits=3;hive=null;
+    P.wx=W/2;P.wy=ARENA1_FLOOR-P.h;P.vx=0;P.vy=0;P.onGround=true;P.wasOnGround=true;
+    camY=P.wy-100-H*0.5;camYTarget=camY;
+    beginClimb(2);
+  } else if(target===3){
+    bossHp=9;totalHits=3;
+    arriveAtArena(3);
+  } else if(target===4){
+    bossHp=6;totalHits=6;hive=null;
+    P.wx=W/2;P.wy=ARENA2_FLOOR-P.h;P.vx=0;P.vy=0;P.onGround=true;P.wasOnGround=true;
+    camY=P.wy-100-H*0.5;camYTarget=camY;
+    beginClimb(4);
+  } else if(target===5){
+    bossHp=6;totalHits=6;
+    arriveAtArena(5);
+  } else if(target===6){
+    bossHp=3;totalHits=9;
+    P.wx=W/2;P.wy=ARENA3_FLOOR-P.h;P.vx=0;P.vy=0;P.onGround=true;P.wasOnGround=true;
+    camY=P.wy-100-H*0.5;camYTarget=camY;
+    beginPhase6();
+  }
+}
+
+function triggerWin(){
+  elapsedTime=getAdjustedElapsedMs();
+  stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+  gameState='win';msg.style.display='block';
+  mtext.innerHTML=`🌳 YOU WIN! 🌳<br><small style="font-size:16px">The Great Tree is defeated!</small><br><small style="font-size:14px;color:#ffe080">⏱ Time: ${formatTime(elapsedTime)} &nbsp;|&nbsp; 💥 Hits taken: ${totalPlayerHits}</small>`;
+  mbtn.textContent='PLAY AGAIN';adBtn.style.display='none';
+}
+
+function triggerTimeOut(){
+  elapsedTime=getAdjustedElapsedMs();
+  deathStartedAt=performance.now();
+  stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+  gameState='dead';msg.style.display='block';
+  mtext.innerHTML='⏰ TIME\'S UP<br><small style="font-size:16px">The tree stands...</small>';
+  mbtn.textContent='TRY AGAIN';adBtn.style.display='block';adBtn.textContent='📺 Watch Ad for +20s';
+}
+
+function hurtPlayer(){
+  if(playerInvuln>0||playerStun>0)return;
+  if(gameMode==='lives')playerHp--;
+  playerInvuln=360;playerStun=1;totalPlayerHits++;
+  playPlayerHurtSound();
+  P.vx=(P.wx>W/2?KNOCKBACK_VX:-KNOCKBACK_VX);P.vy=-KNOCKBACK_VY;
+  spawnParticles(P.wx,toDisp(P.wy-P.h/2),'#f44',6);
+  if(gameMode==='lives'&&playerHp<=0)pendingGameOver=true;
+}
+
+function resolvePlatforms(){
+  let pr=pRect();
+  for(let pl of platforms){
+    let pd={x:pl.wx,y:pl.wy-pl.h,w:pl.w,h:pl.h};
+    if(!rectOverlap(pr,pd))continue;
+    let prevBottom=P.wy-P.vy;
+    if(P.vy>=0&&prevBottom<=pl.wy-pl.h+4){P.wy=pl.wy-pl.h;P.vy=0;P.onGround=true;}
+    else if(P.vy<0){P.wy=pl.wy+P.h;P.vy=1;}
+  }
+}
+
+function resolveSpikes(){
+  if(playerInvuln>0)return;
+  let pr=pRect();
+  for(let sp of spikePatch){
+    // spike hitbox: thin strip along the spike tips
+    let sh=sp.onTop?{x:sp.wx,y:sp.wy-8,w:sp.w,h:8}:{x:sp.wx,y:sp.wy,w:sp.w,h:8};
+    if(rectOverlap(pr,sh))hurtPlayer();
+  }
+}
+
+// ── SPAWN HELPERS ─────────────────────────────────────────────────────────────
+function randDropX(){return WALL_L+30+Math.random()*(W-WALL_L*2-60);}
+
+function pickPair(count1,count2){
+  // count1 nuts, count2 fruits, pairwise >=80px apart, anywhere in the arena
+  let total=count1+count2,xs=[],MAX=60;
+  for(let t=0;t<MAX;t++){
+    xs=[];let ok=true;
+    for(let i=0;i<total;i++)xs.push(randDropX());
+    for(let a=0;a<xs.length&&ok;a++)
+      for(let b=a+1;b<xs.length&&ok;b++)
+        if(Math.abs(xs[a]-xs[b])<80)ok=false;
+    if(ok)break;
+  }
+  return xs;
+}
+
+function queuePair(nutCount,fruitCount){
+  let xs=pickPair(nutCount,fruitCount);
+  for(let i=0;i<nutCount;i++)
+    leafTelegraphs.push({wx:xs[i],progress:0,done:false,dropNow:false,isNut:true});
+  for(let i=0;i<fruitCount;i++)
+    leafTelegraphs.push({wx:xs[nutCount+i],progress:0,done:false,dropNow:false,isNut:false});
+}
+
+function spawnNutAt(wx){nuts.push({wx,wy:camY+4,vx:0,vy:0,rolling:false,dir:Math.random()<0.5?-1:1,dead:false});}
+function spawnFruitAt(wx){fruits.push({wx,wy:camY+4,vx:0,vy:0,dir:Math.random()<0.5?-1:1,dead:false});}
+function spawnNut(){spawnNutAt(randDropX());}
+function spawnFruit(){spawnFruitAt(randDropX());}
+function queueTelegraph(isNut){leafTelegraphs.push({wx:randDropX(),progress:0,done:false,dropNow:false,isNut});}
+
+// ── UPDATE ────────────────────────────────────────────────────────────────────
+function update(){
+  if(gameState!=='playing')return;
+  frameCount++;
+
+  if(isTimerPaused()){
+    if(pauseStartedAt===null)pauseStartedAt=performance.now();
+  } else if(pauseStartedAt!==null){
+    pausedMs+=performance.now()-pauseStartedAt;
+    pauseStartedAt=null;
+  }
+
+  if(gameMode==='time'&&getAdjustedElapsedMs()>=timeLimitMs){triggerTimeOut();return;}
+
+  if(platRespawnPending){
+    if(P.onGround&&!P.wasOnGround)platRespawnTimer=1;
+    if(platRespawnTimer>0){
+      platRespawnTimer++;
+      if(platRespawnTimer>=30){
+        platRespawnPending=false;platRespawnTimer=0;
+        if(platRespawnIsClimb){
+          if(phase===1)beginTreeRiseSequence(ARENA2_FLOOR,2);
+          else if(phase===3)beginTreeRiseSequence(ARENA3_FLOOR,4);
+          else beginTreeRiseSequence(PHASE6_FLOOR,6);
+        } else {
+          if(phase===6){
+            respawnPhase6Layers();
+          } else {
+            // Arena2 (phase3) and arena3 (phase5) both have thorns throughout, from the start
+            let addSpikes=(phase===3)||(phase===5);
+            respawnArenaLayers(addSpikes);
+            if(phase===5)initHive();
+          }
+        }
+      }
+    }
+  }
+  P.wasOnGround=P.onGround;
+
+  if(bossShaking){
+    bossShakeTimer++;
+    updateParticles();updateCamera();if(hitFlash>0)hitFlash--;
+    if(bossShakeTimer>=TREE_SHAKE_FRAMES){bossShaking=false;bossRising=true;bossRiseProgress=0;}
+    return;
+  }
+  if(bossRising){
+    bossRiseProgress+=1/BOSS_RISE_FRAMES;
+    updateParticles();updateCamera();if(hitFlash>0)hitFlash--;
+    if(bossRiseProgress>=1){
+      bossRiseProgress=1;bossRising=false;
+      stopTreeGrowSound();
+      if(pendingClimbPhase===6)beginPhase6();else beginClimb(pendingClimbPhase);
+    }
+    return;
+  }
+
+  const leftHeld=keys['ArrowLeft']||keys['a']||mobileKeys.left;
+  const rightHeld=keys['ArrowRight']||keys['d']||mobileKeys.right;
+  const jumpHeld=keys['ArrowUp']||keys['w']||keys[' ']||mobileKeys.jump;
+
+  if(playerStun>0){
+    P.vy+=GRAV;if(P.vy>MAX_FALL)P.vy=MAX_FALL;P.vx*=0.9;P.wx+=P.vx;P.wy+=P.vy;
+    P.wx=Math.max(WALL_L+P.w/2,Math.min(WALL_R-P.w/2,P.wx));
+    let fl=currentFloorY();P.onGround=false;
+    if(P.wy>=fl){P.wy=fl;P.vy=0;P.onGround=true;}
+    resolvePlatforms();
+    if(noseInvuln>0)noseInvuln--;
+    if(P.onGround){
+      playerStun=0;
+      if(pendingGameOver){
+        pendingGameOver=false;
+        elapsedTime=getAdjustedElapsedMs();
+        deathStartedAt=performance.now();
+        stopAllTumbleSounds();stopHiveSwingSound();stopTreeGrowSound();stopRustleSound();
+        gameState='dead';msg.style.display='block';
+        mtext.innerHTML='💀 YOU FELL<br><small style="font-size:16px">The tree stands...</small>';
+        mbtn.textContent='TRY AGAIN';adBtn.style.display='block';adBtn.textContent='📺 Watch Ad for Extra Life';
+      }
+    }
+    updateParticles();updateCamera();if(hitFlash>0)hitFlash--;
+    return;
+  }
+
+  let dx=0;
+  if(leftHeld)dx=-1;if(rightHeld)dx=1;
+  if(dx!==0){
+    if(Math.sign(P.vx)!==dx&&P.vx!==0)P.vx*=FRIC;
+    P.vx+=dx*ACCEL;P.vx=Math.max(-SPEED,Math.min(SPEED,P.vx));P.facing=dx;
+  } else {P.vx*=FRIC;if(Math.abs(P.vx)<0.05)P.vx=0;}
+  P.vy+=GRAV;if(P.vy>MAX_FALL)P.vy=MAX_FALL;
+  if(P.onGround)P.coyote=COYOTE;else if(P.coyote>0)P.coyote--;
+  if(P.jbuf>0)P.jbuf--;
+  if(jumpHeld&&!keys._jh){P.jbuf=JBUF;keys._jh=true;}
+  if(!jumpHeld)keys._jh=false;
+  if(P.jbuf>0&&P.coyote>0){P.vy=JUMP;P.coyote=0;P.jbuf=0;}
+
+  P.wx+=P.vx;P.wy+=P.vy;
+  P.wx=Math.max(WALL_L+P.w/2,Math.min(WALL_R-P.w/2,P.wx));
+  P.onGround=false;let fl=currentFloorY();
+  if(P.wy>=fl){P.wy=fl;P.vy=0;P.onGround=true;}
+  resolvePlatforms();
+  resolveSpikes();
+
+  // Nose hit
+  if((phase===1||phase===3||phase===5)&&noseInvuln<=0){
+    let nd={x:bossNose.wx-bossNose.w/2,y:bossNose.wy-bossNose.h/2,w:bossNose.w,h:bossNose.h};
+    if(rectOverlap(pRect(),nd)){
+      if(P.vy<0){triggerHit();P.vy=3;}
+      else if(P.vy>0){triggerHit();P.vy=JUMP*0.7;}
+    }
+  } else if(phase===6&&noseInvuln<=0){
+    let nd={x:bossNose.wx-bossNose.w/2,y:bossNose.wy-bossNose.h/2,w:bossNose.w,h:bossNose.h};
+    if(rectOverlap(pRect(),nd)){
+      if(P.vy<0){triggerPhase6Hit();P.vy=3;}
+      else if(P.vy>0){triggerPhase6Hit();P.vy=JUMP*0.7;}
+    }
+  }
+  if(noseInvuln>0)noseInvuln--;
+
+  // Climb arrival
+  if(phase===2){
+    let nf=ARENA2_FLOOR;
+    if(P.vy>=0&&P.wy>=nf&&P.wy-P.vy<=nf){P.wy=nf;P.vy=0;P.onGround=true;arriveAtArena(3);}
+  }
+  if(phase===4){
+    let nf=ARENA3_FLOOR;
+    if(P.vy>=0&&P.wy>=nf&&P.wy-P.vy<=nf){P.wy=nf;P.vy=0;P.onGround=true;arriveAtArena(5);}
+  }
+  if(phase===5)updateHive();
+  if(phase===6){updateHive();updatePhase6Chase();}
+
+  // ── Telegraph update ──────────────────────────────────────────────────────
+  for(let lt of leafTelegraphs){
+    if(lt.done)continue;
+    lt.progress+=1/TELEGRAPH_FRAMES;
+    if(lt.progress>=1){lt.progress=1;lt.done=true;lt.dropNow=true;}
+  }
+  for(let lt of leafTelegraphs){
+    if(lt.dropNow){lt.dropNow=false;if(lt.isNut)spawnNutAt(lt.wx);else spawnFruitAt(lt.wx);}
+  }
+  leafTelegraphs=leafTelegraphs.filter(lt=>!lt.done);
+
+  // ── Spawn logic ───────────────────────────────────────────────────────────
+  const INTERVAL_5=300;
+  const INTERVAL_4=240; // 4s at 60fps
+  let a1Hits=totalHits;
+  let a2Hits=totalHits-3;
+  let a3Hits=totalHits-6;
+
+  if(!spawningEnabled){
+    // no waves until next platform set spawns
+  } else if(phase===1){
+    if(a1Hits>=1){
+      if(nutTimer===0){
+        // spawn immediately on first frame of eligibility
+        if(a1Hits===1)queueTelegraph(true);
+        else           queueTelegraph(false);
+      }
+      nutTimer++;
+      if(nutTimer>=INTERVAL_35){
+        nutTimer=1; // reset to 1 so next spawn fires after full delay
+        if(a1Hits===1)queueTelegraph(true);
+        else           queueTelegraph(false);
+      }
+    }
+  } else if(phase===2){
+    // First platforming section: 1 nut + 1 fruit every 4s
+    if(nutTimer===0)queuePair(1,1);
+    nutTimer++;
+    if(nutTimer>=INTERVAL_4){nutTimer=1;queuePair(1,1);}
+  } else if(phase===3){
+    // Second arena section: thorns are always present (handled via addSpikes elsewhere)
+    if(a2Hits===0){
+      // before the first hit: thorns only, no waves
+    } else if(a2Hits===1){
+      // after the first hit: wave of 2, alternating 2-nuts/2-fruits, every 4s
+      if(nutTimer===0){queuePair(altWaveIsNuts?2:0,altWaveIsNuts?0:2);altWaveIsNuts=!altWaveIsNuts;}
+      nutTimer++;
+      if(nutTimer>=INTERVAL_4){nutTimer=1;queuePair(altWaveIsNuts?2:0,altWaveIsNuts?0:2);altWaveIsNuts=!altWaveIsNuts;}
+    } else if(a2Hits>=2){
+      // after the second hit: wave of (1+2 or 2+1), every 5s
+      if(nutTimer===0){if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+      nutTimer++;
+      if(nutTimer>=INTERVAL_5){nutTimer=1;if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+    }
+  } else if(phase===4){
+    // Second platforming section: wave of (1+2 or 2+1), every 5s
+    if(nutTimer===0){if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+    nutTimer++;
+    if(nutTimer>=INTERVAL_5){nutTimer=1;if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+  } else if(phase===5){
+    // Third arena section: thorns + durian always present (handled elsewhere)
+    if(a3Hits===0){
+      // before the first hit: thorns + durian only, no waves
+    } else if(a3Hits===1){
+      // after the first hit: wave of 2, alternating 2-nuts/2-fruits, every 4s
+      if(nutTimer===0){queuePair(altWaveIsNuts?2:0,altWaveIsNuts?0:2);altWaveIsNuts=!altWaveIsNuts;}
+      nutTimer++;
+      if(nutTimer>=INTERVAL_4){nutTimer=1;queuePair(altWaveIsNuts?2:0,altWaveIsNuts?0:2);altWaveIsNuts=!altWaveIsNuts;}
+    } else if(a3Hits>=2){
+      // after the second hit: wave of (1+2 or 2+1), every 5s
+      if(nutTimer===0){if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+      nutTimer++;
+      if(nutTimer>=INTERVAL_5){nutTimer=1;if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+    }
+  } else if(phase===6){
+    // Third platforming section: wave of (1+2 or 2+1), every 5s
+    if(nutTimer===0){if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+    nutTimer++;
+    if(nutTimer>=INTERVAL_5){nutTimer=1;if(Math.random()<0.5)queuePair(1,2);else queuePair(2,1);}
+  }
+  // ── Nuts ──────────────────────────────────────────────────────────────────
+  for(let n of nuts){
+    if(!n.rolling){n.vy+=GRAV*0.12;if(n.vy>1.8)n.vy=1.8;}
+    n.wx+=n.vx;n.wy+=n.vy;
+    let f2=currentFloorY();
+    if(n.wy>=f2){n.wy=f2;n.vy=0;if(!n.rolling){n.rolling=true;n.vx=n.dir*0.7;let dv=distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST);playThudSound(dv);startTumbleSound(n);}}
+    for(let pl of platforms){
+      let pd={x:pl.wx,y:pl.wy-pl.h,w:pl.w,h:pl.h},nd2={x:n.wx-NUT_RADIUS,y:n.wy-NUT_RADIUS*2,w:NUT_RADIUS*2,h:NUT_RADIUS*2};
+      if(rectOverlap(nd2,pd)&&n.vy>=0){n.wy=pl.wy-pl.h;n.vy=0;if(!n.rolling){n.rolling=true;n.vx=n.dir*0.7;let dv=distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST);playThudSound(dv);startTumbleSound(n);}}
+    }
+    if(n.rolling){
+      let onSurface=false;
+      if(n.wy>=f2-1)onSurface=true;
+      for(let pl of platforms){if(n.wx>=pl.wx&&n.wx<=pl.wx+pl.w&&Math.abs(n.wy-(pl.wy-pl.h))<=2)onSurface=true;}
+      if(!onSurface){n.rolling=false;stopTumbleSound(n);}
+      else updateTumbleVolume(n,distToPlayer(n.wx,n.wy-NUT_RADIUS));
+      n.rot=(n.rot||0)+n.vx/NUT_RADIUS; // rolling-without-slipping: spin speed matches slide speed
+    }
+    if(n.wx<-40||n.wx>W+40){spawnParticles(n.wx,toDisp(n.wy-NUT_RADIUS),'#d9a866',8);stopTumbleSound(n);playNutCrackSound(distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST));n.dead=true;}
+    let pr=pRect(),nr={x:n.wx-NUT_RADIUS,y:n.wy-NUT_RADIUS*2,w:NUT_RADIUS*2,h:NUT_RADIUS*2},nCenter=n.wy-NUT_RADIUS;
+    if(rectOverlap(pr,nr)&&!n.dead){
+      if(P.vy>0&&P.wy-P.h<nCenter){ // landing on top
+        spawnParticles(n.wx,toDisp(n.wy-NUT_RADIUS),'#d9a866',8);stopTumbleSound(n);playNutCrackSound(distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST));
+        n.dead=true;P.vy=JUMP*0.55;
+      } else if(P.vy<0&&P.wy>nCenter){ // jumping up into it from below
+        spawnParticles(n.wx,toDisp(n.wy-NUT_RADIUS),'#d9a866',8);stopTumbleSound(n);playNutCrackSound(distanceVolumeScale(distToPlayer(n.wx,n.wy-NUT_RADIUS),OBJECT_SOUND_MAX_DIST));
+        n.dead=true;P.vy=2;
+      }
+    }
+  }
+  nuts=nuts.filter(n=>!n.dead);
+
+  // ── Fruits ────────────────────────────────────────────────────────────────
+  const FRUIT_BOUNCE=-3.5;
+  const FRUIT_SQUASH_HOLD_FRAMES=24; // matches where the deform curve in drawFruits crosses from squash into stretch
+  for(let f of fruits){
+    f.bounceTimer=(f.bounceTimer||0)+1;
+    if(f.grounded){
+      // Anticipation: stay pinned on the ground through the squash, launch right as it starts stretching
+      if(f.bounceTimer>=FRUIT_SQUASH_HOLD_FRAMES){
+        f.grounded=false;f.vy=FRUIT_BOUNCE;f.vx=f.dir*0.9;
+      }
+    } else {
+      f.vy+=GRAV*0.18;if(f.vy>1.2)f.vy=1.2;f.wx+=f.vx;f.wy+=f.vy;
+      let f2=currentFloorY();
+      if(f.wy>=f2){
+        if(f.knockedUp){f.dir=P.wx>f.wx?1:-1;f.knockedUp=false;}
+        f.wy=f2;f.vy=0;f.vx=0;f.bounceTimer=0;f.grounded=true;playBounceSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));
+      }
+      for(let pl of platforms){
+        let pd={x:pl.wx,y:pl.wy-pl.h,w:pl.w,h:pl.h},fd={x:f.wx-12,y:f.wy-24,w:24,h:24};
+        if(rectOverlap(fd,pd)&&f.vy>0){
+          if(f.knockedUp){f.dir=P.wx>f.wx?1:-1;f.knockedUp=false;}
+          f.wy=pl.wy-pl.h;f.vy=0;f.vx=0;f.bounceTimer=0;f.grounded=true;playBounceSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));
+        }
+      }
+    }
+    if(f.wx<-40||f.wx>W+40){spawnParticles(f.wx,toDisp(f.wy-12),'#e05050',10);playFruitCrackSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));f.dead=true;}
+    let pr=pRect(),fr={x:f.wx-12,y:f.wy-24,w:24,h:24},fCenter=f.wy-12;
+    if(rectOverlap(pr,fr)&&!f.dead){
+      if(P.vy>0&&P.wy-P.h<fCenter){ // landing on top
+        spawnParticles(f.wx,toDisp(f.wy-12),'#e05050',10);playFruitCrackSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));
+        f.dead=true;P.vy=JUMP*0.55;
+      } else if(P.vy<0&&P.wy>fCenter){ // jumping up into it from below
+        f.vy=-4;f.vx=0;f.grounded=false;f.bounceTimer=0;f.knockedUp=true;
+        playBounceSound(distanceVolumeScale(distToPlayer(f.wx,f.wy-12),OBJECT_SOUND_MAX_DIST));
+        P.vy=2;playerInvuln=6; // P.vy flips sign here, so the hazard-damage check below can't re-derive this as a bottom-hit on its own — this fruit survives (unlike nuts), so without a brief grace window it'd otherwise hurt the player in the same frame
+      }
+    }
+  }
+  fruits=fruits.filter(f=>!f.dead);
+
+  // ── Hazard damage ─────────────────────────────────────────────────────────
+  if(playerInvuln<=0){
+    let pr=pRect();
+    for(let n of nuts){
+      let nr={x:n.wx-NUT_RADIUS,y:n.wy-NUT_RADIUS*2,w:NUT_RADIUS*2,h:NUT_RADIUS*2},nCenter=n.wy-NUT_RADIUS;
+      let topHit=P.vy>0&&P.wy-P.h<nCenter,bottomHit=P.vy<0&&P.wy>nCenter;
+      if(rectOverlap(pr,nr)&&!topHit&&!bottomHit){hurtPlayer();break;}
+    }
+    for(let f of fruits){
+      let fr={x:f.wx-12,y:f.wy-24,w:24,h:24},fCenter=f.wy-12;
+      let topHit=P.vy>0&&P.wy-P.h<fCenter,bottomHit=P.vy<0&&P.wy>fCenter;
+      if(rectOverlap(pr,fr)&&!topHit&&!bottomHit){hurtPlayer();break;}
+    }
+    if((phase===5||phase===6)&&hive){
+      let hr={x:hive.wx-HIVE_RADIUS,y:hive.wy-HIVE_RADIUS,w:HIVE_RADIUS*2,h:HIVE_RADIUS*2};
+      if(rectOverlap(pr,hr))hurtPlayer();
+    }
+  }
+  if(playerInvuln>0)playerInvuln--;
+
+  P.animTimer++;if(P.animTimer>8){P.animTimer=0;P.animFrame=(P.animFrame+1)%4;}
+  updateParticles();updateCamera();if(hitFlash>0)hitFlash--;
+}
+
+function updateCamera(){
+  if(camLocked)camY+=(camYTarget-camY)*0.12;
+  else{let target=P.wy-100-H*0.5;camY+=(target-camY)*0.1;}
+}
+
+function spawnParticles(dx,dy,color,n){
+  for(let i=0;i<n;i++){
+    let a=Math.random()*Math.PI*2,s=2+Math.random()*4;
+    particles.push({x:dx,y:dy,vx:Math.cos(a)*s,vy:Math.sin(a)*s-2,life:40,color});
+  }
+}
+function updateParticles(){for(let p of particles){p.x+=p.vx;p.y+=p.vy;p.vy+=0.1;p.life--;}particles=particles.filter(p=>p.life>0);}
+
+// ── DRAW ──────────────────────────────────────────────────────────────────────
+function draw(){
+  ctx.clearRect(0,0,W,H);ctx.fillStyle='#1a0a3a';ctx.fillRect(0,0,W,H);
+  for(let i=0;i<40;i++)ctx.fillRect((i*137)%W,(i*97)%H,2,2);
+  drawWalls();drawBoss();drawGround();drawPlatforms();drawSpikes();
+  drawNuts();drawFruits();drawNose();drawHive();drawPlayer();drawParticles();drawLeafTelegraphs();drawHUD();
+  drawMobileControls();
+  if(hitFlash>0){ctx.fillStyle=`rgba(255,200,0,${hitFlash/40*0.3})`;ctx.fillRect(0,0,W,H);}
+}
+
+function drawGround(){
+  for(let fy of[ARENA1_FLOOR,ARENA2_FLOOR,ARENA3_FLOOR]){
+    let dy=toDisp(fy);
+    if(dy>H||dy+100<0)continue; // skip only once the (fixed 100px-tall) band is fully off-screen
+    ctx.fillStyle='#3a5a1a';ctx.fillRect(0,dy,W,100);ctx.fillStyle='#2a4010';ctx.fillRect(0,dy,W,10);
+  }
+}
+function drawWalls(){
+  ctx.fillStyle='#2a4010';ctx.fillRect(0,0,WALL_L,H);ctx.fillRect(W-WALL_L,0,WALL_L,H);
+  ctx.strokeStyle='#1a3008';ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(WALL_L,0);ctx.lineTo(WALL_L,H);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(W-WALL_L,0);ctx.lineTo(W-WALL_L,H);ctx.stroke();
+}
+function drawBoss(){
+  let cx=W/2,floorY=phase===1?ARENA1_FLOOR:phase<=3?ARENA2_FLOOR:phase===6?bossNose.wy+30:ARENA3_FLOOR;
+  if(bossRising){
+    // ease the boss upward from its old floor to the new one
+    let ease=1-Math.pow(1-bossRiseProgress,3);
+    floorY=bossRiseFromFloor+(bossRiseToFloor-bossRiseFromFloor)*ease;
+  }
+  if(bossShaking){
+    let mag=4+10*(bossShakeTimer/TREE_SHAKE_FRAMES);
+    cx+=(Math.random()-0.5)*mag;
+  }
+  let baseD=toDisp(floorY),trunkW=phase>=3?90:70;
+  // Trunk span: normally a fixed height above its own anchor. During the shake/rise cinematic,
+  // the camera stays locked on the ground while the canopy rises, so keep the trunk's base
+  // planted there too (stretching it taller) instead of letting the whole trunk drift upward
+  // and detach from the floor. In phase 6 itself, the canopy (baseD) now tracks the weakspot
+  // as it flees upward, so the default headroom above it is already enough — just keep the
+  // trunk's bottom pinned to the real ground instead of following the canopy up too.
+  let trunkTopD=baseD-H*2,trunkBottomD=baseD;
+  if(bossShaking||bossRising){trunkBottomD=toDisp(bossRiseFromFloor);}
+  else if(phase===2){trunkBottomD=toDisp(ARENA1_FLOOR)+50;}
+  else if(phase===4){trunkBottomD=toDisp(ARENA2_FLOOR)+50;}
+  else if(phase===6){trunkBottomD=toDisp(ARENA3_FLOOR)+50;}
+  ctx.fillStyle='#5a3010';ctx.fillRect(cx-trunkW/2,trunkTopD,trunkW,trunkBottomD-trunkTopD);
+  ctx.strokeStyle='#3a2008';ctx.lineWidth=3;
+  for(let i=0;i<8;i++){ctx.beginPath();ctx.moveTo(cx-trunkW/2+6+i*9,trunkTopD);ctx.lineTo(cx-trunkW/2+10+i*9,trunkBottomD);ctx.stroke();}
+  // Red leaves: fully red in the final section itself, and gradually transitioning to red
+  // during the shake specifically heading into it (not the other two shake/rise transitions).
+  let redT=phase===6?1:((bossShaking||bossRising)&&pendingClimbPhase===6)?(bossShaking?bossShakeTimer/TREE_SHAKE_FRAMES:1):0;
+  let greenColors=['#2a6a10','#3a8020','#4a9030','#2a5a0a'],redColors=['#8a1a10','#a02818','#b83a20','#7a1208'];
+  let colors=greenColors.map((g,i)=>lerpColor(g,redColors[i],redT));
+  let leafOutline=lerpColor('#1a3008','#3a0a04',redT);
+  let radii=[140,120,100,80],yoffs=[-280,-240,-200,-170];
+  for(let i=0;i<4;i++){
+    ctx.fillStyle=colors[i];ctx.beginPath();ctx.ellipse(cx,baseD+yoffs[i],radii[i],radii[i]*0.7,0,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle=leafOutline;ctx.lineWidth=4;ctx.stroke();
+  }
+  let eyeY=baseD-220;
+  let intenseFace=bossShaking||bossRising||phase===6; // anger spikes during every shake/rise, and stays through the final section
+  ctx.fillStyle=intenseFace?'#ffd0d0':'#fff';ctx.beginPath();ctx.ellipse(cx-28,eyeY,18,14,0,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.ellipse(cx+28,eyeY,18,14,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#1a0a00';ctx.beginPath();ctx.ellipse(cx-25,eyeY,9,10,0,0,Math.PI*2);ctx.fill();
+  ctx.beginPath();ctx.ellipse(cx+25,eyeY,9,10,0,0,Math.PI*2);ctx.fill();
+  if(phase>=3||intenseFace){
+    ctx.strokeStyle='#1a0a00';ctx.lineWidth=intenseFace?7:5;
+    let browDrop=intenseFace?-22:-14,browIn=intenseFace?-4:-8;
+    ctx.beginPath();ctx.moveTo(cx-44,eyeY+browDrop);ctx.lineTo(cx-10,eyeY+browIn);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(cx+44,eyeY+browDrop);ctx.lineTo(cx+10,eyeY+browIn);ctx.stroke();
+  }
+}
+function drawNose(){
+  if(phase===2||phase===4)return;
+  let noseWy=bossNose.wy;
+  if(bossRising){
+    let ease=1-Math.pow(1-bossRiseProgress,3);
+    noseWy=noseRiseFromY+(noseRiseToY-noseRiseFromY)*ease;
+  }
+  let dx=bossNose.wx-bossNose.w/2,dy=toDisp(noseWy-bossNose.h/2),w=bossNose.w,h=bossNose.h;
+  if(phase===6&&phase6Telegraphing&&gameState==='playing'){
+    dx+=(Math.random()-0.5)*8;
+    dy+=(Math.random()-0.5)*5;
+    ctx.shadowColor='#fff4a0';
+    ctx.shadowBlur=14+10*Math.sin(phase6TelegraphTimer*0.8); // pulsing glow while it winds up
+  }
+  let col=noseInvuln>0&&Math.floor(noseInvuln/6)%2===0?'#ff4':'#e84030';
+  // Squash-and-stretch reaction to being hit, driven by the existing noseInvuln countdown
+  // (set to 90 right at a hit, counting down to 0) — same damped-oscillation language as
+  // the fruit's bounce deformation. At noseInvuln=0 this settles to exactly neutral (1.0).
+  let t=1-noseInvuln/90,osc=Math.cos(t*Math.PI*2.5)*Math.exp(-2.2*t);
+  let scaleY=1-0.4*osc,scaleX=1/scaleY;
+  let anchorX=dx+w/2,anchorY=dy; // top of the nose, where the stem attaches — stays fixed
+  ctx.save();
+  ctx.translate(anchorX,anchorY);ctx.scale(scaleX,scaleY);ctx.translate(-anchorX,-anchorY);
+  ctx.fillStyle=col;ctx.beginPath();ctx.ellipse(dx+w/2,dy+h*0.6,w/2,h/2,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#2a8010';ctx.fillRect(dx+w/2-3,dy,6,12);
+  ctx.fillStyle='rgba(255,255,255,0.4)';ctx.beginPath();ctx.ellipse(dx+w*0.3,dy+h*0.4,8,5,-0.4,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#1a0a00';ctx.lineWidth=3;ctx.beginPath();ctx.ellipse(dx+w/2,dy+h*0.6,w/2,h/2,0,0,Math.PI*2);ctx.stroke();
+  ctx.restore();
+  if(phase===6&&phase6Telegraphing&&gameState==='playing'){ctx.shadowBlur=0;ctx.shadowColor='rgba(0,0,0,0)';} // don't let the glow leak into later draw calls
+}
+function drawHive(){
+  if(!hive)return;
+  let hx=hive.wx,hy=toDisp(hive.wy),py=toDisp(hive.pivotWy);
+  let theta=HIVE_THETA_MAX*Math.sin(hive.phi);
+  let rot=-theta; // rotates together with the swing, like a rigid body on the end of the stem — no independent spin
+  // Stem stays aligned with the actual pendulum arm (same direction as pivot->body), so it
+  // always meets the body at the same point relative to the body's own rotated orientation,
+  // instead of always touching a fixed point "above" it regardless of swing angle.
+  let stemEndX=hx-HIVE_RADIUS*0.9*Math.sin(theta),stemEndY=hy-HIVE_RADIUS*0.9*Math.cos(theta);
+  ctx.strokeStyle='#5a4a20';ctx.lineWidth=5;
+  ctx.beginPath();ctx.moveTo(hive.pivotWx,py);ctx.lineTo(stemEndX,stemEndY);ctx.stroke();
+  ctx.fillStyle='#4a3a18';ctx.fillRect(hive.pivotWx-5,py-3,10,7);
+  ctx.save();
+  ctx.translate(hx,hy);ctx.rotate(rot);
+  let grad=ctx.createRadialGradient(-HIVE_RADIUS*0.3,-HIVE_RADIUS*0.3,HIVE_RADIUS*0.1,0,0,HIVE_RADIUS);
+  grad.addColorStop(0,'#a8e063');grad.addColorStop(1,'#5a9d1f');
+  ctx.fillStyle=grad;
+  ctx.beginPath();ctx.ellipse(0,0,HIVE_RADIUS,HIVE_RADIUS*1.05,0,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#3a6a10';ctx.lineWidth=2;ctx.stroke();
+  const spikeCount=18,spikeLen=HIVE_RADIUS*0.32,spikeHalfAngle=0.12;
+  ctx.fillStyle='#8fc04a';
+  for(let i=0;i<spikeCount;i++){
+    let ang=i*(Math.PI*2/spikeCount);
+    let bx1=Math.cos(ang-spikeHalfAngle)*HIVE_RADIUS,by1=Math.sin(ang-spikeHalfAngle)*HIVE_RADIUS;
+    let bx2=Math.cos(ang+spikeHalfAngle)*HIVE_RADIUS,by2=Math.sin(ang+spikeHalfAngle)*HIVE_RADIUS;
+    let tx=Math.cos(ang)*(HIVE_RADIUS+spikeLen),ty=Math.sin(ang)*(HIVE_RADIUS+spikeLen);
+    ctx.beginPath();ctx.moveTo(bx1,by1);ctx.lineTo(tx,ty);ctx.lineTo(bx2,by2);ctx.closePath();ctx.fill();
+    ctx.strokeStyle='#5a8a2a';ctx.lineWidth=1;ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawPlatforms(){
+  for(let pl of platforms){
+    let dy=toDisp(pl.wy-pl.h);if(dy>H+20||dy<-20)continue;
+    ctx.fillStyle='#5a3a10';
+    ctx.beginPath();ctx.roundRect(pl.wx,dy,pl.w,pl.h,4);ctx.fill();
+    ctx.strokeStyle='#2a1a00';ctx.lineWidth=2;ctx.stroke();
+  }
+}
+function drawSpikes(){
+  for(let sp of spikePatch){
+    let baseY=toDisp(sp.wy);if(baseY>H+20||baseY<-20)continue;
+    let step=10;
+    for(let tx=sp.wx;tx<sp.wx+sp.w;tx+=step){
+      ctx.beginPath();
+      if(sp.onTop){
+        ctx.moveTo(tx,baseY);ctx.lineTo(tx+step/2,baseY-10);ctx.lineTo(tx+step,baseY);
+      } else {
+        ctx.moveTo(tx,baseY);ctx.lineTo(tx+step/2,baseY+10);ctx.lineTo(tx+step,baseY);
+      }
+      ctx.closePath();
+      ctx.fillStyle='#ff1010';ctx.fill();
+      ctx.strokeStyle='#000';ctx.lineWidth=1.5;ctx.stroke();
+    }
+  }
+}
+function drawNuts(){
+  for(let n of nuts){
+    let dx=n.wx,dy=toDisp(n.wy-NUT_RADIUS);if(dy>H+20||dy<-20)continue;
+    let rot=n.rot||0;
+    ctx.fillStyle='#d9a866'; // brighter & more desaturated than the branches (#5a3a10)
+    ctx.beginPath();ctx.ellipse(dx,dy,NUT_RADIUS,NUT_RADIUS,0,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='#8a6a3a';ctx.lineWidth=1.5;ctx.stroke();
+    // Small dark accent rotating with the nut, so the spin still reads clearly
+    let capR=NUT_RADIUS*0.45;
+    ctx.fillStyle='#4a3010';
+    ctx.beginPath();ctx.ellipse(dx+Math.cos(rot)*capR,dy+Math.sin(rot)*capR,NUT_RADIUS*0.22,NUT_RADIUS*0.22,0,0,Math.PI*2);ctx.fill();
+  }
+}
+function drawFruits(){
+  for(let f of fruits){
+    let dx=f.wx,dy=toDisp(f.wy-24);if(dy>H+20||dy<-20)continue;
+    let t=Math.min((f.bounceTimer||0)/120,1); // 120 frames = 2s, holds neutral after that
+    let osc=Math.cos(t*Math.PI*2.5)*Math.exp(-2.2*t); // damped oscillation: squash, stretch, settle
+    let scaleY=1-0.4*osc,scaleX=1/scaleY; // volume-preserving squash/stretch
+    let groundY=toDisp(f.wy); // anchor the deformation to the fixed ground-contact point
+    ctx.save();
+    ctx.translate(dx,groundY);ctx.scale(scaleX,scaleY);ctx.translate(-dx,-groundY);
+    ctx.fillStyle='#e05050';ctx.beginPath();ctx.ellipse(dx,dy+8,13,16,0,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle='#1a0a00';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#2a8010';ctx.fillRect(dx-2,dy-4,5,10);
+    ctx.fillStyle='rgba(255,255,255,0.3)';ctx.beginPath();ctx.ellipse(dx-4,dy+4,4,6,-0.3,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+  }
+}
+function drawPlayer(){
+  let alpha=(playerInvuln>0&&Math.floor(playerInvuln/6)%2===0)?0.35:1;ctx.globalAlpha=alpha;
+  let px=P.wx,py=toDisp(P.wy),f=P.facing;
+  ctx.fillStyle='#e8c040';ctx.beginPath();ctx.roundRect(px-10,py-30,20,22,4);ctx.fill();
+  ctx.strokeStyle='#1a0a00';ctx.lineWidth=2.5;ctx.stroke();
+  ctx.fillStyle='#f8d860';ctx.beginPath();ctx.ellipse(px,py-38,13,13,0,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#1a0a00';ctx.lineWidth=2.5;ctx.stroke();
+  ctx.fillStyle='#1a0a00';ctx.beginPath();ctx.ellipse(px+f*4,py-40,4,4,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#fff';ctx.beginPath();ctx.ellipse(px+f*5,py-42,1.5,1.5,0,0,Math.PI*2);ctx.fill();
+  let lg=P.onGround?Math.sin(P.animFrame*Math.PI/2)*5:0;
+  ctx.fillStyle='#c8a030';ctx.fillRect(px-8,py-8,7,10+lg);ctx.fillRect(px+1,py-8,7,10-lg);
+  ctx.strokeStyle='#1a0a00';ctx.lineWidth=2;ctx.strokeRect(px-8,py-8,7,10+lg);ctx.strokeRect(px+1,py-8,7,10-lg);
+  ctx.fillStyle='#2a5090';ctx.fillRect(px-10,py-48,20,6);ctx.fillRect(px-7,py-56,14,10);
+  ctx.strokeStyle='#1a0a00';ctx.lineWidth=2;ctx.strokeRect(px-10,py-48,20,6);ctx.strokeRect(px-7,py-56,14,10);
+  ctx.globalAlpha=1;
+}
+function drawParticles(){
+  for(let p of particles){ctx.globalAlpha=p.life/40;ctx.fillStyle=p.color;ctx.fillRect(p.x-3,p.y-3,6,6);}
+  ctx.globalAlpha=1;
+}
+function drawLeafTelegraphs(){
+  for(let lt of leafTelegraphs){
+    let x=lt.wx,prog=lt.progress,colH=60*prog,baseY=4,leafCount=5;
+    ctx.save();ctx.globalAlpha=0.55+0.35*prog;
+    for(let i=0;i<leafCount;i++){
+      let t=i/(leafCount-1),ly=baseY+t*colH;
+      let wobble=Math.sin(frameCount*0.18+i*1.4)*6*(1-t),lx=x+wobble;
+      let scale=0.6+0.4*prog,angle=-0.4+Math.sin(frameCount*0.12+i)*0.5;
+      ctx.save();ctx.translate(lx,ly);ctx.rotate(angle);ctx.scale(scale,scale);
+      ctx.fillStyle=i%2===0?'#4a9a20':'#3a7a10';
+      ctx.beginPath();ctx.ellipse(0,0,7,13,0,0,Math.PI*2);ctx.fill();
+      ctx.strokeStyle='#1a3008';ctx.lineWidth=1.5;ctx.stroke();
+      ctx.strokeStyle='#2a5a10';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(0,-11);ctx.lineTo(0,11);ctx.stroke();
+      ctx.restore();
+    }
+    let arrowY=baseY+colH+8;
+    ctx.fillStyle=`rgba(255,220,0,${0.5+0.5*prog})`;
+    ctx.beginPath();ctx.moveTo(x,arrowY+10);ctx.lineTo(x-8,arrowY);ctx.lineTo(x+8,arrowY);ctx.closePath();ctx.fill();
+    ctx.restore();
+  }
+}
+function drawHUD(){
+  if(gameState!=='title'&&gameState!=='win'){
+  if(gameMode==='lives'){
+    ctx.font='bold 18px Arial';ctx.textBaseline='middle';
+    for(let i=0;i<3;i++){ctx.fillStyle=i<playerHp?'#e84040':'#444';ctx.fillText('♥',14+i*22,22);}
+    ctx.textBaseline='alphabetic';
+  } else {
+    ctx.fillStyle='rgba(255,255,255,0.55)';ctx.font='bold 13px Arial';ctx.textAlign='left';
+    ctx.fillText('⏰ TIME MODE',12,24);
+  }
+
+  // Hit counter + timer, stacked below the player's HP hearts (top-left) — 50% larger
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(10,32,126,27);
+  ctx.fillStyle='#ff9090';ctx.font='bold 17px Arial';ctx.textAlign='left';
+  ctx.fillText('💥 '+totalPlayerHits,19,52);
+  let elapsed=gameState==='playing'?getAdjustedElapsedMs():elapsedTime;
+  let paused=gameState==='playing'&&isTimerPaused();
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(10,62,126,27);
+  if(gameMode==='time'){
+    let remainingMs=Math.max(0,timeLimitMs-elapsed);
+    let urgent=remainingMs<=20000;
+    ctx.fillStyle=urgent?'#ff6060':paused?'rgba(255,224,128,0.5)':'#ffe080';ctx.font='bold 17px Arial';
+    ctx.fillText((paused?'⏸ ':'⏰ ')+formatTime(remainingMs),19,82);
+  } else {
+    ctx.fillStyle=paused?'rgba(255,224,128,0.5)':'#ffe080';ctx.font='bold 17px Arial';
+    ctx.fillText((paused?'⏸ ':'⏱ ')+formatTime(elapsed),19,82);
+  }
+
+  let labels={1:'PHASE 1',2:'CLIMBING...',3:'PHASE 2',4:'CLIMBING...',5:'PHASE 3',6:'FINAL CLIMB'};
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(W/2-60,10,120,20);
+  ctx.fillStyle='#fff8c0';ctx.font='bold 13px Arial';ctx.textAlign='center';
+  ctx.fillText(labels[phase]||'',W/2,25);ctx.textAlign='left';
+
+  // Boss health bar (top-center, below the phase label) — bossHp is now one continuous
+  // pool (12 total) spanning all 4 sections (3 hits each). Ticks mark the boundary after
+  // each section. The fill represents *remaining* HP, so those boundaries sit at 9/12,
+  // 6/12, and 3/12 of the way across (not 3/12, 6/12, 9/12 — the bar empties from the
+  // right as hits land, not fills from the right).
+  let bossFrac=Math.max(0,bossHp/12);
+  let barW=330,barH=21,barX=W/2-barW/2,barY=58;
+  ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(barX-9,barY-24,barW+18,barH+33);
+  ctx.fillStyle='#e8d8b0';ctx.font='bold 15px Arial';ctx.textAlign='center';
+  ctx.fillText('🌳 TREE',W/2,barY-6);
+  ctx.fillStyle='#3a2008';ctx.fillRect(barX,barY,barW,barH);
+  ctx.fillStyle=bossFrac>0.5?'#7a9d3a':bossFrac>0.25?'#d9a030':'#c0392b';
+  ctx.fillRect(barX,barY,barW*bossFrac,barH);
+  ctx.strokeStyle='rgba(0,0,0,0.55)';ctx.lineWidth=3;
+  for(let frac of[9/12,6/12,3/12]){
+    let tx=barX+barW*frac;
+    ctx.beginPath();ctx.moveTo(tx,barY);ctx.lineTo(tx,barY+barH);ctx.stroke();
+  }
+  ctx.strokeStyle='#1a0a00';ctx.lineWidth=3;ctx.strokeRect(barX,barY,barW,barH);
+  ctx.textAlign='left';
+  }
+
+  if(frameCount<300){ctx.fillStyle='rgba(255,255,255,0.6)';ctx.font='11px Arial';ctx.fillText('← → Move   ↑/W/Space Jump',10,H-12);}
+  if(DEBUG_MODE){ctx.fillStyle='rgba(255,255,255,0.45)';ctx.font='10px Arial';ctx.fillText('DEBUG 1-6: Arena1 / Climb1 / Arena2 / Climb2 / Arena3 / FinalClimb',10,H-2);}
+  if(gameState==='playing'){
+    ctx.fillStyle='rgba(0,0,0,0.55)';ctx.beginPath();ctx.roundRect(W-88,10,78,22,4);ctx.fill();
+    ctx.strokeStyle='#aaa';ctx.lineWidth=1;ctx.beginPath();ctx.roundRect(W-88,10,78,22,4);ctx.stroke();
+    ctx.fillStyle='#ffee88';ctx.font='bold 11px Arial';ctx.textAlign='right';ctx.fillText('⏸ PAUSE',W-8,26);ctx.textAlign='left';
+  }
+}
+
+// ── MOBILE CONTROLS ───────────────────────────────────────────────────────────
+const BTN_SIZE=56,BTN_MARGIN=14;
+const btnLeft ={x:BTN_MARGIN,            y:H-BTN_SIZE-BTN_MARGIN,w:BTN_SIZE,h:BTN_SIZE,label:'◀'};
+const btnRight={x:BTN_MARGIN*2+BTN_SIZE, y:H-BTN_SIZE-BTN_MARGIN,w:BTN_SIZE,h:BTN_SIZE,label:'▶'};
+const btnJump ={x:W-BTN_SIZE-BTN_MARGIN, y:H-BTN_SIZE-BTN_MARGIN,w:BTN_SIZE,h:BTN_SIZE,label:'▲'};
+function drawMobileControls(){
+  if(gameState!=='playing')return;
+  for(let b of[btnLeft,btnRight,btnJump]){
+    let active=(b===btnLeft&&mobileKeys.left)||(b===btnRight&&mobileKeys.right)||(b===btnJump&&mobileKeys.jump);
+    ctx.globalAlpha=active?0.85:0.55;ctx.fillStyle=active?'#e8c040':'#334';
+    ctx.beginPath();ctx.roundRect(b.x,b.y,b.w,b.h,10);ctx.fill();
+    ctx.strokeStyle='#aaa';ctx.lineWidth=2;ctx.stroke();
+    ctx.globalAlpha=1;ctx.fillStyle='#fff';ctx.font='bold 22px Arial';
+    ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(b.label,b.x+b.w/2,b.y+b.h/2);
+  }
+  ctx.textAlign='left';ctx.textBaseline='alphabetic';
+}
+function hitTest(touch,btn){
+  const r=C.getBoundingClientRect(),sx=C.width/r.width,sy=C.height/r.height;
+  const tx=(touch.clientX-r.left)*sx,ty=(touch.clientY-r.top)*sy;
+  return tx>=btn.x&&tx<=btn.x+btn.w&&ty>=btn.y&&ty<=btn.y+btn.h;
+}
+function updateMobileKeys(e){
+  mobileKeys.left=false;mobileKeys.right=false;mobileKeys.jump=false;
+  for(let t of e.touches){
+    if(hitTest(t,btnLeft))mobileKeys.left=true;
+    if(hitTest(t,btnRight))mobileKeys.right=true;
+    if(hitTest(t,btnJump))mobileKeys.jump=true;
+  }
+}
+C.addEventListener('touchstart',e=>{e.preventDefault();updateMobileKeys(e);},{passive:false});
+C.addEventListener('touchmove', e=>{e.preventDefault();updateMobileKeys(e);},{passive:false});
+C.addEventListener('touchend',  e=>{e.preventDefault();updateMobileKeys(e);},{passive:false});
+window.addEventListener('keydown',e=>{
+  if(DEBUG_MODE&&!keys[e.key]&&['1','2','3','4','5','6'].includes(e.key))debugGoto(Number(e.key));
+  keys[e.key]=true;e.preventDefault();
+});
+window.addEventListener('keyup',e=>{keys[e.key]=false;});
+C.addEventListener('click',e=>{
+  const r=C.getBoundingClientRect();
+  const cx=(e.clientX-r.left)*(W/r.width),cy=(e.clientY-r.top)*(H/r.height);
+  if(gameState==='playing'&&cx>W-88&&cy<32)openPauseMenu();
+});
+
+function loop(){update();draw();requestAnimationFrame(loop);}
+msg.style.display='block';
+mtext.innerHTML='🌳 THE GREAT TREE 🌳<br><small style="font-size:14px">Hit the glowing nose fruit to deal damage!<br>Use platforms to climb!</small>';
+mbtn.onclick=startGame;
+loop();
+</script>
+</body></html>
